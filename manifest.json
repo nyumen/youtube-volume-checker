@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Volume Checker",
+  "version": "0.1.0",
+  "description": "Capture current YouTube tab audio and show 10s window RMS(dB)/peak status overlay.",
+  "permissions": ["tabCapture", "tabs", "offscreen"],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://*.youtube.com/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Start/Stop Volume Check"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://*.youtube.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
