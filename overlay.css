@@ -51,10 +51,25 @@
   white-space: pre-wrap;
 }
 
-.vc-controls {
+.vc-controls{
   margin-top: 8px;
   font-size: 12px;
   opacity: 0.95;
+
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.vc-controls .vc-toggle{
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.vc-controls .vc-btn{
+  margin-left: auto; /* 右寄せ */
+  flex: 0 0 auto;
 }
 
 .vc-toggle {
@@ -95,3 +110,56 @@
 .vc-silent { border-color: rgba(170, 170, 255, 0.55); }
 .vc-danger { border-color: rgba(255, 70, 70, 0.65); }
 .vc-error { border-color: rgba(255, 170, 170, 0.65); }
+
+/* --- Buttons --- */
+.vc-btn{
+  appearance: none;
+  border: 1px solid rgba(255,255,255,0.22);
+  background: rgba(255,255,255,0.10);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.vc-btn:hover{
+  background: rgba(255,255,255,0.16);
+}
+
+.vc-btn:active{
+  transform: translateY(1px);
+}
+
+.vc-btn:disabled{
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Calibrate button (id selector; optional accent) */
+#vc-calibrate{
+  border-color: rgba(180, 220, 255, 0.35);
+}
+
+/* --- Note dismiss button inside note --- */
+.vc-note-dismiss{
+  margin-top: 6px;
+  display: inline-block;
+  appearance: none;
+  border: 1px solid rgba(255,255,255,0.22);
+  background: rgba(255,255,255,0.10);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 5px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.vc-note-dismiss:hover{
+  background: rgba(255,255,255,0.16);
+}
