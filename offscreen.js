@@ -1,30 +1,23 @@
 // offscreen.js (MV3 offscreen document, module)
-//
-// - Receive {tabId, streamId} from SW
-// - getUserMedia with chromeMediaSourceId
-// - Analyze last 10s: peak, rms_db
-// - Status every 0.5s
-// - Optional playback via GainNode (default muted)
-// - Rules (priority): DANGER(0.995 any) > WARN(0.98 >=0.5s) > SILENT > SMALL > LOUD > OK
-
 console.log("[VC] offscreen loaded");
 
 // ===== Config =====
 const UPDATE_INTERVAL_MS = 500;
 const WINDOW_SEC = 10;
 
-// Thresholds (user spec)
-const PEAK_DANGER_ANY = 0.995;    // DANGER: any occurrence in window
-const PEAK_WARN = 0.98;           // WARN: accumulated time in window
+// Thresholds
+const PEAK_WARN = 0.98;        // 🟡 音量注意: accumulated >= 0.5s in last 10s
 const WARN_HOLD_SEC = 0.5;
 
-const RMS_SMALL_DB = -24;        // user requested
-const RMS_LOUD_DB = -16;         // user adjusted
+const RMS_SMALL_DB = -24;
+const RMS_LOUD_DB  = -16;
 
-// "Silent" detection (to avoid "SMALL" when paused)
-// You can tune these after trying.
-const SILENT_RMS_DB = -60;        // below this is effectively silent
-const SILENT_PEAK = 0.01;         // also require peak small
+// Silent detection (avoid "SMALL" when paused)
+const SILENT_RMS_DB = -60;
+const SILENT_PEAK   = 0.01;
+
+// Worklet report chunk size
+const WORKLET_REPORT_SAMPLES = 4096;
 
 const sessions = new Map();
 
@@ -45,39 +38,32 @@ function computeWindowMetrics(blocks, cutoffMs) {
   let peak = 0;
   let sumSq = 0;
   let n = 0;
-
   let warnTimeSec = 0;
-  let dangerSeen = false;
 
   for (const b of blocks) {
     peak = Math.max(peak, b.peak);
     sumSq += b.sumSq;
     n += b.n;
 
-    if (b.peak > PEAK_DANGER_ANY) dangerSeen = true;
     if (b.peak > PEAK_WARN) warnTimeSec += (b.durSec ?? 0);
   }
 
   const rms = n > 0 ? Math.sqrt(sumSq / n) : 0;
   const rms_db = rmsToDb(rms);
 
-  return { peak, rms_db, warnTimeSec, dangerSeen };
+  return { peak, rms_db, warnTimeSec };
 }
 
-function classify({ peak, rms_db, warnTimeSec, dangerSeen }) {
-  // priority: DANGER > WARN > SILENT > SMALL > LOUD > OK
-  if (dangerSeen) return "DANGER";
+function classify({ peak, rms_db, warnTimeSec }) {
+  // priority: WARN > SILENT > SMALL > LOUD > OK
   if (warnTimeSec >= WARN_HOLD_SEC) return "WARN";
-
-  // silent (pause) should not show SMALL
   if (rms_db <= SILENT_RMS_DB && peak <= SILENT_PEAK) return "SILENT";
-
   if (rms_db < RMS_SMALL_DB) return "SMALL";
   if (rms_db > RMS_LOUD_DB) return "LOUD";
   return "OK";
 }
 
-async function startWithStreamId(tabId, streamId) {
+async function startWithStreamId(tabId, streamId, correctionDb = 0, outputEnabled = false) {
   if (sessions.has(tabId)) await stop(tabId);
 
   try {
@@ -93,92 +79,101 @@ async function startWithStreamId(tabId, streamId) {
       video: false
     });
 
-    const audioCtx = new AudioContext();
+    const audioCtx = new AudioContext({ latencyHint: "playback" });
     try { if (audioCtx.state === "suspended") await audioCtx.resume(); } catch {}
 
     const source = audioCtx.createMediaStreamSource(media);
 
-    // IMPORTANT: output channels = 2, so we can pass-through to outputBuffer
-    const processor = audioCtx.createScriptProcessor(4096, 2, 2);
-
-    // Playback control (default muted)
+    // Playback control
     const gainNode = audioCtx.createGain();
-    const outputEnabled = false;
     gainNode.gain.value = outputEnabled ? 1.0 : 0.0;
+
+    // Analysis path is silent (avoid audible artifacts)
+    const silentOut = audioCtx.createGain();
+    silentOut.gain.value = 0.0;
+
+    // Worklet meter
+    await audioCtx.audioWorklet.addModule(chrome.runtime.getURL("vc-meter-processor.js"));
+    const meterNode = new AudioWorkletNode(audioCtx, "vc-meter", {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [2],
+      processorOptions: { reportSamples: WORKLET_REPORT_SAMPLES }
+    });
 
     const blocks = [];
 
-    processor.onaudioprocess = (e) => {
-      const inBuf = e.inputBuffer;
-      const outBuf = e.outputBuffer;
-
-      // ---- pass-through: copy input -> output ----
-      const inCh0 = inBuf.getChannelData(0);
-      const outCh0 = outBuf.getChannelData(0);
-      outCh0.set(inCh0);
-
-      const outCh1 = outBuf.getChannelData(1);
-      if (inBuf.numberOfChannels > 1) {
-        const inCh1 = inBuf.getChannelData(1);
-        outCh1.set(inCh1);
-      } else {
-        outCh1.set(inCh0); // duplicate mono
-      }
-
-      // ---- analysis: use ch0 for metrics ----
-      const sr = audioCtx.sampleRate;
-      const durSec = inCh0.length / sr;
-
-      let peak = 0;
-      let sumSq = 0;
-      for (let i = 0; i < inCh0.length; i++) {
-        const v = inCh0[i];
-        const a = Math.abs(v);
-        if (a > peak) peak = a;
-        sumSq += v * v;
-      }
-
-      blocks.push({
-        t: nowMs(),
-        peak,
-        sumSq,
-        n: inCh0.length,
-        durSec
-      });
-
-      pruneOldBlocks(blocks, nowMs() - (WINDOW_SEC + 2) * 1000);
+    const session = {
+      tabId,
+      media,
+      audioCtx,
+      source,
+      meterNode,
+      gainNode,
+      silentOut,
+      blocks,
+      timer: null,
+      outputEnabled: !!outputEnabled,
+      correctionDb: Number.isFinite(correctionDb) ? correctionDb : 0
     };
 
-    // Graph: source -> processor -> gain -> destination
-    source.connect(processor);
-    processor.connect(gainNode);
+    // Receive block metrics from worklet
+    meterNode.port.onmessage = (ev) => {
+      const d = ev?.data || {};
+      if (typeof d.peak !== "number") return;
+
+      session.blocks.push({
+        t: nowMs(),
+        peak: d.peak,
+        sumSq: typeof d.sumSq === "number" ? d.sumSq : 0,
+        n: typeof d.n === "number" ? d.n : 0,
+        durSec: typeof d.durSec === "number" ? d.durSec : 0
+      });
+
+      pruneOldBlocks(session.blocks, nowMs() - (WINDOW_SEC + 2) * 1000);
+    };
+
+    // ===== Graph =====
+    // Playback path: source -> gain -> destination
+    source.connect(gainNode);
     gainNode.connect(audioCtx.destination);
+
+    // Analysis path: source -> meter -> silent -> destination
+    source.connect(meterNode);
+    meterNode.connect(silentOut);
+    silentOut.connect(audioCtx.destination);
+
+    // Send initial ACK to sync UI
+    chrome.runtime.sendMessage({
+      type: "VC_OUTPUT_STATE",
+      tabId,
+      enabled: session.outputEnabled
+    });
 
     const timer = setInterval(() => {
       const cutoffMs = nowMs() - WINDOW_SEC * 1000;
-      const metrics = computeWindowMetrics(blocks, cutoffMs);
-      const status = classify(metrics);
+      const metrics = computeWindowMetrics(session.blocks, cutoffMs);
+
+      // Apply correction to RMS(dB) only (peak unchanged)
+      const rms_db_corrected = metrics.rms_db + session.correctionDb;
+
+      const status = classify({
+        peak: metrics.peak,
+        rms_db: rms_db_corrected,
+        warnTimeSec: metrics.warnTimeSec
+      });
 
       chrome.runtime.sendMessage({
         type: "VC_METRICS",
         tabId,
         status,
         peak: metrics.peak,
-        rms_db: metrics.rms_db
+        rms_db: rms_db_corrected
       });
     }, UPDATE_INTERVAL_MS);
 
-    sessions.set(tabId, {
-      tabId,
-      media,
-      audioCtx,
-      source,
-      processor,
-      gainNode,
-      blocks,
-      timer,
-      outputEnabled
-    });
+    session.timer = timer;
+    sessions.set(tabId, session);
 
   } catch (err) {
     console.error("[VC] offscreen start error", err);
@@ -196,9 +191,13 @@ async function stop(tabId) {
 
   try {
     clearInterval(s.timer);
-    try { s.processor.disconnect(); } catch {}
-    try { s.source.disconnect(); } catch {}
-    try { s.gainNode.disconnect(); } catch {}
+
+    try { s.meterNode?.port?.postMessage({ type: "STOP" }); } catch {}
+    try { s.meterNode?.disconnect(); } catch {}
+    try { s.source?.disconnect(); } catch {}
+    try { s.gainNode?.disconnect(); } catch {}
+    try { s.silentOut?.disconnect(); } catch {}
+
     try { await s.audioCtx.close(); } catch {}
     try { s.media.getTracks().forEach(t => t.stop()); } catch {}
   } finally {
@@ -212,9 +211,27 @@ function setOutput(tabId, enabled) {
 
   s.outputEnabled = !!enabled;
   s.gainNode.gain.value = s.outputEnabled ? 1.0 : 0.0;
+
+  // ACK back
+  chrome.runtime.sendMessage({
+    type: "VC_OUTPUT_STATE",
+    tabId,
+    enabled: s.outputEnabled
+  });
+
   console.log("[VC] output", tabId, s.outputEnabled ? "ON" : "OFF");
 }
 
+function setCorrection(tabId, correctionDb) {
+  const s = sessions.get(tabId);
+  if (!s) return;
+  if (typeof correctionDb !== "number" || !Number.isFinite(correctionDb)) return;
+
+  s.correctionDb = correctionDb;
+  console.log("[VC] correction", tabId, correctionDb.toFixed(2), "dB");
+}
+
+// ===== Message bridge =====
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || typeof msg !== "object") return;
 
@@ -227,7 +244,12 @@ chrome.runtime.onMessage.addListener((msg) => {
       });
       return;
     }
-    startWithStreamId(msg.tabId, msg.streamId);
+    startWithStreamId(
+      msg.tabId,
+      msg.streamId,
+      msg.correctionDb ?? 0,
+      msg.outputEnabled ?? false
+    );
     return;
   }
 
@@ -238,6 +260,11 @@ chrome.runtime.onMessage.addListener((msg) => {
 
   if (msg.type === "VC_SET_OUTPUT" && typeof msg.tabId === "number") {
     setOutput(msg.tabId, !!msg.enabled);
+    return;
+  }
+
+  if (msg.type === "VC_SET_CORRECTION" && typeof msg.tabId === "number") {
+    setCorrection(msg.tabId, msg.correctionDb);
     return;
   }
 });
